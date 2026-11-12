@@ -2,20 +2,44 @@
 /**
  * Plugin Name: Feishu Internal Links
  * Description: Sync keyword rules from a Feishu document and add internal links in the block editor.
- * Version: 0.3.1
+ * Version: 0.4.0
  * Requires at least: 6.2
  * Requires PHP: 7.4
  */
 if (!defined('ABSPATH')) exit;
 const FIL_OPTION = 'fil_settings';
 const FIL_RULES = 'fil_rules';
-const FIL_CRON = 'fil_daily_sync';
+const FIL_CRON = 'fil_scheduled_sync_v2';
+function fil_next_sync_timestamp($settings, $now = null) {
+ $frequency=$settings['sync_frequency'] ?? 'daily';
+ if ($frequency==='off') return false;
+ $timezone=wp_timezone();
+ $now=$now === null ? new DateTimeImmutable('now', $timezone) : (new DateTimeImmutable('@'.(int)$now))->setTimezone($timezone);
+ $time=$settings['sync_time'] ?? '03:00';
+ if (!preg_match('/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/', $time)) $time='03:00';
+ list($hour,$minute)=array_map('intval', explode(':', $time));
+ $next=$frequency==='hourly' ? $now->setTime((int)$now->format('H'), $minute, 0) : $now->setTime($hour, $minute, 0);
+ if ($frequency==='hourly') {
+  if ($next <= $now) $next=$next->modify('+1 hour');
+ } elseif ($frequency==='weekly') {
+  $day=isset($settings['sync_day']) ? (int)$settings['sync_day'] : 1;
+  if ($day<0 || $day>6) $day=1;
+  $offset=($day-(int)$next->format('w')+7)%7;
+  if ($offset) $next=$next->modify('+'.$offset.' days');
+  if ($next <= $now) $next=$next->modify('+7 days');
+ } elseif ($next <= $now) $next=$next->modify('+1 day');
+ return $next->getTimestamp();
+}
 function fil_schedule_sync() {
- if (!wp_next_scheduled(FIL_CRON)) wp_schedule_event(time() + DAY_IN_SECONDS, 'daily', FIL_CRON);
+ if (wp_next_scheduled('fil_daily_sync')) wp_clear_scheduled_hook('fil_daily_sync');
+ if (!wp_next_scheduled(FIL_CRON)) {
+  $timestamp=fil_next_sync_timestamp(get_option(FIL_OPTION, []));
+  if ($timestamp) wp_schedule_single_event($timestamp, FIL_CRON);
+ }
 }
 add_action('init', 'fil_schedule_sync');
 register_activation_hook(__FILE__, 'fil_schedule_sync');
-register_deactivation_hook(__FILE__, function () { wp_clear_scheduled_hook(FIL_CRON); });
+register_deactivation_hook(__FILE__, function () { wp_clear_scheduled_hook(FIL_CRON); wp_clear_scheduled_hook('fil_daily_sync'); });
 add_action('admin_menu', function () { add_options_page('飞书内链', '飞书内链', 'manage_options', 'fil-settings', 'fil_settings_page'); });
 function fil_settings_page() {
  if (!current_user_can('manage_options')) return;
@@ -25,18 +49,37 @@ function fil_settings_page() {
  echo '<p>请提供多维表格自身的 /base/ 链接和数据表 ID（table 参数），而不是外层 /docx/ 文档链接。字段名称须为“关键词”“内链地址”“状态”，状态为“启用”或“停用”。</p><form method="post" action="'.esc_url(admin_url('admin-post.php')).'">';
  wp_nonce_field('fil_save'); echo '<input type="hidden" name="action" value="fil_save"><table class="form-table">';
  foreach (['app_id'=>'App ID','base'=>'多维表格 /base/ 链接或 App Token','table_id'=>'数据表 ID（单表可留空）'] as $key=>$label) echo '<tr><th><label for="'.esc_attr($key).'">'.esc_html($label).'</label></th><td><input class="regular-text" id="'.esc_attr($key).'" name="'.esc_attr($key).'" value="'.esc_attr($s[$key] ?? '').'"></td></tr>';
+ foreach (['max_per_run'=>['每次识别最多添加',10], 'max_per_target'=>['每个目标地址每篇最多出现',1]] as $key=>$setting) {
+  $value=isset($s[$key]) ? intval($s[$key]) : $setting[1];
+  echo '<tr><th><label for="'.esc_attr($key).'">'.esc_html($setting[0]).'</label></th><td><input type="number" min="0" max="1000" step="1" required id="'.esc_attr($key).'" name="'.esc_attr($key).'" value="'.esc_attr($value).'"> <span>0 表示不限制；每个目标地址的数量包含已有链接</span></td></tr>';
+ }
+ $frequency=$s['sync_frequency'] ?? 'daily'; $day=isset($s['sync_day']) ? (int)$s['sync_day'] : 1; $time=$s['sync_time'] ?? '03:00';
+ echo '<tr><th><label for="sync_frequency">自动同步频率</label></th><td><select id="sync_frequency" name="sync_frequency">';
+ foreach (['hourly'=>'每小时','daily'=>'每天','weekly'=>'每周','off'=>'关闭'] as $value=>$label) echo '<option value="'.esc_attr($value).'" '.selected($frequency,$value,false).'>'.esc_html($label).'</option>';
+ echo '</select></td></tr><tr><th><label for="sync_day">每周同步日</label></th><td><select id="sync_day" name="sync_day">';
+ foreach (['星期日','星期一','星期二','星期三','星期四','星期五','星期六'] as $value=>$label) echo '<option value="'.esc_attr($value).'" '.selected($day,$value,false).'>'.esc_html($label).'</option>';
+ echo '</select> <span>仅每周同步时生效</span></td></tr><tr><th><label for="sync_time">自动同步时间</label></th><td><input type="time" required id="sync_time" name="sync_time" value="'.esc_attr($time).'"> <span>使用 WordPress 站点时区；每小时同步仅使用分钟</span></td></tr>';
  echo '<tr><th><label for="secret">App Secret</label></th><td><input type="password" class="regular-text" id="secret" name="secret" value="" autocomplete="new-password"><p class="description">'.(empty($s['secret']) ? '请输入密钥。' : '已保存；留空保留原密钥。').'</p></td></tr></table>';
  submit_button('保存设置'); echo '</form><form method="post" action="'.esc_url(admin_url('admin-post.php')).'">'; wp_nonce_field('fil_sync'); echo '<input type="hidden" name="action" value="fil_sync">'; submit_button('同步飞书关键词库', 'secondary'); echo '</form><p>已保存 '.count($rules).' 条规则。上次成功同步：'.esc_html(get_option('fil_synced_at', '尚未同步')).'</p>';
  $result=get_option('fil_sync_result', []);
  if (!empty($result['time'])) echo '<p>最近一次同步（'.esc_html($result['time']).'）：'.esc_html($result['message']).'</p>';
  $next=wp_next_scheduled(FIL_CRON);
- echo '<p>自动同步：每天一次。'.($next ? '下次计划时间：'.esc_html(wp_date('Y-m-d H:i:s', $next)).'（站点时区）。' : '计划任务尚未安排，请检查 WordPress 定时任务。').'</p><p>同步时间可能因网站访问和定时任务配置而延后。</p></div>'; 
+ echo '<p>自动同步：'.esc_html(['hourly'=>'每小时','daily'=>'每天','weekly'=>'每周','off'=>'关闭'][$s['sync_frequency'] ?? 'daily'] ?? '每天').'。'.($next ? '下次计划时间：'.esc_html(wp_date('Y-m-d H:i:s', $next)).'（站点时区）。' : (($s['sync_frequency'] ?? 'daily')==='off' ? '自动同步已关闭。' : '计划任务尚未安排，请检查 WordPress 定时任务。')).'</p><p>同步时间可能因网站访问和定时任务配置而延后。</p></div>';
 }
 function fil_redirect($message) { wp_safe_redirect(add_query_arg(['page'=>'fil-settings','fil_message'=>$message], admin_url('options-general.php'))); exit; }
 add_action('admin_post_fil_save', function () {
  if (!current_user_can('manage_options')) wp_die('Forbidden'); check_admin_referer('fil_save');
  $old=get_option(FIL_OPTION, []); $secret=trim(wp_unslash($_POST['secret'] ?? ''));
- update_option(FIL_OPTION, ['app_id'=>sanitize_text_field(wp_unslash($_POST['app_id'] ?? '')), 'base'=>sanitize_text_field(wp_unslash($_POST['base'] ?? '')), 'table_id'=>sanitize_text_field(wp_unslash($_POST['table_id'] ?? '')), 'secret'=>$secret !== '' ? $secret : ($old['secret'] ?? '')], false);
+ $limits=[]; foreach (['max_per_run'=>10, 'max_per_target'=>1] as $key=>$default) {
+  $raw=isset($_POST[$key]) ? wp_unslash($_POST[$key]) : (string)$default;
+  if (!is_string($raw) || !preg_match('/^(0|[1-9][0-9]{0,3})$/', $raw) || (int)$raw>1000) fil_redirect('数量设置必须为 0 至 1000 的整数；设置未保存。');
+  $limits[$key]=(int)$raw;
+ }
+ $frequency=sanitize_text_field(wp_unslash($_POST['sync_frequency'] ?? 'daily'));
+ $day=wp_unslash($_POST['sync_day'] ?? '1'); $time=wp_unslash($_POST['sync_time'] ?? '03:00');
+ if (!in_array($frequency, ['hourly','daily','weekly','off'], true) || !is_string($day) || !preg_match('/^[0-6]$/', $day) || !is_string($time) || !preg_match('/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/', $time)) fil_redirect('自动同步设置无效；设置未保存。');
+ update_option(FIL_OPTION, ['app_id'=>sanitize_text_field(wp_unslash($_POST['app_id'] ?? '')), 'base'=>sanitize_text_field(wp_unslash($_POST['base'] ?? '')), 'table_id'=>sanitize_text_field(wp_unslash($_POST['table_id'] ?? '')), 'secret'=>$secret !== '' ? $secret : ($old['secret'] ?? ''), 'max_per_run'=>$limits['max_per_run'], 'max_per_target'=>$limits['max_per_target'], 'sync_frequency'=>$frequency, 'sync_day'=>(int)$day, 'sync_time'=>$time], false);
+ wp_clear_scheduled_hook(FIL_CRON); fil_schedule_sync();
  fil_redirect('设置已保存。');
 });
 function fil_request($url, $args=[]) {
@@ -131,13 +174,14 @@ function fil_run_sync() {
  update_option('fil_sync_result', ['time'=>current_time('mysql'), 'message'=>$message], false);
  return $message;
 }
-add_action(FIL_CRON, 'fil_run_sync');
+add_action(FIL_CRON, function () { try { fil_run_sync(); } finally { fil_schedule_sync(); } });
 add_action('admin_post_fil_sync', function () {
  if (!current_user_can('manage_options')) wp_die('Forbidden');
  check_admin_referer('fil_sync');
  fil_redirect(fil_run_sync());
 });
 add_action('enqueue_block_editor_assets', function () {
- wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.3.1', true);
- wp_add_inline_script('fil-editor', 'window.filData = '.wp_json_encode(['rules'=>get_option(FIL_RULES, []),'home'=>home_url('/')], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT).';', 'before');
+ wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.4.0', true);
+ $settings=get_option(FIL_OPTION, []);
+ wp_add_inline_script('fil-editor', 'window.filData = '.wp_json_encode(['rules'=>get_option(FIL_RULES, []),'home'=>home_url('/'), 'maxPerRun'=>isset($settings['max_per_run']) ? (int)$settings['max_per_run'] : 10, 'maxPerTarget'=>isset($settings['max_per_target']) ? (int)$settings['max_per_target'] : 1], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT).';', 'before');
 });

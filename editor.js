@@ -6,6 +6,8 @@
   const { Button, Notice } = wp.components;
   const store = 'core/block-editor';
   const config = window.filData || { rules: [], home: '' };
+  const maxPerRun = Number.isInteger(config.maxPerRun) && config.maxPerRun >= 0 ? config.maxPerRun : 10;
+  const maxPerTarget = Number.isInteger(config.maxPerTarget) && config.maxPerTarget >= 0 ? config.maxPerTarget : 1;
   function canonical(url) {
     try { if (!url) return ''; const u = new URL(url, config.home); u.hash = ''; return u.origin + u.pathname.replace(/\/$/, '') + u.search; } catch (_) { return ''; }
   }
@@ -17,12 +19,20 @@
   function flatten(blocks) { return blocks.reduce((a, b) => a.concat([b], flatten(b.innerBlocks || [])), []); }
   function compute() {
     const blocks = flatten(wp.data.select(store).getBlocks());
-    const used = new Set();
-    blocks.forEach(b => { const html = contentHTML(b.attributes.content); if (html === null) return; const d = document.createElement('div'); d.innerHTML = html; d.querySelectorAll('a[href]').forEach(a => used.add(canonical(a.getAttribute('href')))); });
+    const used = new Map();
+    function countExisting(value, depth) {
+      if (depth > 12 || value == null) return;
+      const html = contentHTML(value);
+      if (html !== null) {
+        const d = document.createElement('div'); d.innerHTML = html;
+        d.querySelectorAll('a[href]').forEach(a => { const target = canonical(a.getAttribute('href')); if (target) used.set(target, (used.get(target) || 0) + 1); });
+      } else if (Array.isArray(value)) value.forEach(item => countExisting(item, depth + 1));
+      else if (typeof value === 'object') Object.values(value).forEach(item => countExisting(item, depth + 1));
+    }
+    blocks.forEach(b => countExisting(b.attributes, 0));
     const current = canonical(window.location.origin + window.location.pathname);
     const post = wp.data.select('core/editor');
     const permalink = post && post.getPermalink ? canonical(post.getPermalink() || '') : '';
-    if (permalink) used.add(permalink);
     const rules = config.rules.slice().sort((a,b) => b.keyword.length - a.keyword.length);
     const changes = [], matches = [];
     const diagnostics = { paragraphs: 0, textNodes: 0, keywordHits: 0, invalid: 0, self: 0, existing: 0, boundaries: 0, eligible: 0 };
@@ -34,11 +44,11 @@
       const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
       const nodes = []; let blockChanged = false; while (walker.nextNode()) nodes.push(walker.currentNode);
       for (const node of nodes) {
-        if (matches.length >= 10) break;
+        if (maxPerRun > 0 && matches.length >= maxPerRun) break;
         if (node.parentElement.closest('a, code, pre, script, style')) continue;
         diagnostics.textNodes++;
         const text = node.nodeValue; let pos = 0; const frag = document.createDocumentFragment(); let changed = false;
-        while (pos < text.length && matches.length < 10) {
+        while (pos < text.length && (maxPerRun === 0 || matches.length < maxPerRun)) {
           let best = null;
           for (const rule of rules) {
             const target = canonical(rule.url);
@@ -46,7 +56,7 @@
             if (keywordPresent) diagnostics.keywordHits++;
             if (!target) { if (keywordPresent) diagnostics.invalid++; continue; }
             if (target === current || target === permalink) { if (keywordPresent) diagnostics.self++; continue; }
-            if (used.has(target)) { if (keywordPresent) diagnostics.existing++; continue; }
+            if (maxPerTarget > 0 && (used.get(target) || 0) >= maxPerTarget) { if (keywordPresent) diagnostics.existing++; continue; }
             if (keywordPresent) diagnostics.eligible++;
             const escaped = rule.keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const re = new RegExp(escaped, 'gi'); re.lastIndex = pos; let m;
@@ -61,12 +71,12 @@
           if (!best) break;
           frag.appendChild(document.createTextNode(text.slice(pos, best.index)));
           const a = document.createElement('a'); a.href = best.url; a.textContent = best.text; frag.appendChild(a);
-          used.add(best.target); matches.push({ keyword:best.text, url:best.url }); pos = best.index + best.text.length; changed = true;
+          used.set(best.target, (used.get(best.target) || 0) + 1); matches.push({ keyword:best.text, url:best.url }); pos = best.index + best.text.length; changed = true;
         }
         if (changed) { frag.appendChild(document.createTextNode(text.slice(pos))); node.replaceWith(frag); blockChanged = true; }
       }
       if (blockChanged) changes.push({ id:block.clientId, original:original, content:box.innerHTML });
-      if (matches.length >= 10) break;
+      if (maxPerRun > 0 && matches.length >= maxPerRun) break;
     }
     return { changes, matches, diagnostics, snapshot: JSON.stringify(blocks.map(b => [b.clientId,b.name,contentHTML(b.attributes.content)])), permalink };
   }
@@ -85,7 +95,7 @@
       setMessage('已添加 '+plan.matches.length+' 个内链。请检查正文并保存草稿。'); setPlan(null);
     }
     return el(wp.element.Fragment, {}, el(PluginSidebarMoreMenuItem, { target:'fil-sidebar' }, '飞书内链'), el(PluginSidebar, { name:'fil-sidebar', title:'飞书内链' }, el('div',{style:{padding:'16px'}},
-      el('p',{},'已同步 '+config.rules.length+' 条规则。每篇最多添加 10 个链接；每个目标地址最多一次。'),
+      el('p',{},'已同步 '+config.rules.length+' 条规则。每次最多添加 '+(maxPerRun || '不限')+' 个链接；每个目标地址每篇最多 '+(maxPerTarget || '不限')+' 次（含已有链接）。'),
       el(Button,{variant:'primary',onClick:preview,disabled:!config.rules.length},'识别内链'),
       message && el(Notice,{status:'info',isDismissible:false},message),
       plan && plan.matches.length > 0 && el(wp.element.Fragment,{},el('p',{},'将添加 '+plan.matches.length+' 个链接：'),el('ul',{},plan.matches.map((m,i)=>el('li',{key:i,style:{marginBottom:'10px',overflowWrap:'anywhere'}},el('strong',{},m.keyword),' → ',m.url))),el(Button,{variant:'primary',onClick:apply},'确认添加'), ' ',el(Button,{variant:'secondary',onClick:()=>setPlan(null)},'取消'))
