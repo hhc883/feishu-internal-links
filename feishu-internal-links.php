@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Feishu Internal Links
  * Description: Sync keyword rules from a Feishu document and add internal links in the block editor.
- * Version: 0.3.0
+ * Version: 0.3.1
  * Requires at least: 6.2
  * Requires PHP: 7.4
  */
@@ -84,7 +84,7 @@ function fil_text_value($value) {
  }
  return trim($out);
 }
-function fil_rules_from_records($records, $site) {
+function fil_rules_from_records($records) {
  $rules=[]; $errors=[]; $seen=[];
  foreach ($records as $index=>$record) {
   $f=$record['fields'] ?? []; if (!is_array($f)) throw new Exception('记录数据格式无效，原规则未更改。');
@@ -94,13 +94,13 @@ function fil_rules_from_records($records, $site) {
   if ($keyword==='' && $status==='' && $link==='') continue;
   if ($status==='停用') continue;
   $url=esc_url_raw($link, ['http','https']); $host=wp_parse_url($url, PHP_URL_HOST); $scheme=wp_parse_url($url, PHP_URL_SCHEME);
-  if ($keyword==='' || $status!=='启用' || !preg_match('~^https?://~i', $link) || !$url || !$host || !in_array(strtolower((string)$scheme), ['http','https'], true) || strcasecmp($host,$site)!==0 || preg_match('/[\r\n]/', $keyword)) { $errors[]=$id; continue; }
+  if ($keyword==='' || $status!=='启用' || !preg_match('~^https?://~i', $link) || !$url || !$host || !in_array(strtolower((string)$scheme), ['http','https'], true) || preg_match('/[\r\n]/', $keyword)) { $errors[]=$id; continue; }
   $key=strtolower($keyword);
   if (isset($seen[$key]) && $seen[$key]!==$url) { $errors[]=$id; continue; }
   if (isset($seen[$key])) continue;
   $seen[$key]=$url; $rules[]=['keyword'=>$keyword, 'url'=>$url];
  }
- if ($errors) throw new Exception('记录 '.implode('、',array_slice($errors,0,20)).' 无效或关键词冲突（共 '.count($errors).' 条）；请检查关键词、状态及本站完整 URL。原规则未更改。');
+ if ($errors) throw new Exception('记录 '.implode('、',array_slice($errors,0,20)).' 无效或关键词冲突（共 '.count($errors).' 条）；请检查关键词、状态及完整的 HTTP/HTTPS URL。原规则未更改。');
  return $rules;
 }
 function fil_sync_rules() {
@@ -120,7 +120,7 @@ function fil_sync_rules() {
   foreach ($fields as $field) if (isset($field['field_name'], $field['type'])) $types[$field['field_name']]=intval($field['type']);
   if (($types['关键词'] ?? 0)!==1 || !in_array($types['内链地址'] ?? 0,[1,15],true) || ($types['状态'] ?? 0)!==3) throw new Exception('字段不匹配：关键词须为文本，内链地址须为超链接或文本，状态须为单选；请检查字段名称和类型。');
   $records=fil_list_all($endpoint.'/records', $auth['tenant_access_token']);
-  $rules=fil_rules_from_records($records, (string)wp_parse_url(home_url(), PHP_URL_HOST));
+  $rules=fil_rules_from_records($records);
   update_option(FIL_RULES, $rules, false);
   update_option('fil_synced_at', current_time('mysql'), false);
   return '同步成功，共 '.count($rules).' 条规则。';
@@ -138,6 +138,6 @@ add_action('admin_post_fil_sync', function () {
  fil_redirect(fil_run_sync());
 });
 add_action('enqueue_block_editor_assets', function () {
- wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.3.0', true);
+ wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.3.1', true);
  wp_add_inline_script('fil-editor', 'window.filData = '.wp_json_encode(['rules'=>get_option(FIL_RULES, []),'home'=>home_url('/')], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT).';', 'before');
 });
