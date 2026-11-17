@@ -8,6 +8,18 @@
   const config = window.filData || { rules: [], home: '' };
   const maxPerRun = Number.isInteger(config.maxPerRun) && config.maxPerRun >= 0 ? config.maxPerRun : 10;
   const maxPerTarget = Number.isInteger(config.maxPerTarget) && config.maxPerTarget >= 0 ? config.maxPerTarget : 1;
+  const sameSiteOnly = config.sameSiteOnly === true;
+  const siteHostname = sameSiteOnly ? matchingHostname(config.home) : '';
+  const rules = (sameSiteOnly
+    ? config.rules.filter(rule => siteHostname && matchingHostname(rule.url) === siteHostname)
+    : config.rules.slice()).sort((a, b) => b.keyword.length - a.keyword.length);
+  function matchingHostname(url) {
+    try {
+      return new URL(url).hostname.replace(/^www\./, '');
+    } catch (_) {
+      return '';
+    }
+  }
   function canonical(url) {
     try { if (!url) return ''; const u = new URL(url, config.home); u.hash = ''; return u.origin + u.pathname.replace(/\/$/, '') + u.search; } catch (_) { return ''; }
   }
@@ -33,7 +45,6 @@
     const current = canonical(window.location.origin + window.location.pathname);
     const post = wp.data.select('core/editor');
     const permalink = post && post.getPermalink ? canonical(post.getPermalink() || '') : '';
-    const rules = config.rules.slice().sort((a,b) => b.keyword.length - a.keyword.length);
     const changes = [], matches = [];
     const diagnostics = { paragraphs: 0, textNodes: 0, keywordHits: 0, invalid: 0, self: 0, existing: 0, boundaries: 0, eligible: 0 };
     for (const block of blocks) {
@@ -96,7 +107,8 @@
     }
     return el(wp.element.Fragment, {}, el(PluginSidebarMoreMenuItem, { target:'fil-sidebar' }, '飞书内链'), el(PluginSidebar, { name:'fil-sidebar', title:'飞书内链' }, el('div',{style:{padding:'16px'}},
       el('p',{},'已同步 '+config.rules.length+' 条规则。每次最多添加 '+(maxPerRun || '不限')+' 个链接；每个目标地址每篇最多 '+(maxPerTarget || '不限')+' 次（含已有链接）。'),
-      el(Button,{variant:'primary',onClick:preview,disabled:!config.rules.length},'识别内链'),
+      sameSiteOnly && el('p', {}, '仅匹配当前站点链接，可用规则 ' + rules.length + ' 条。'),
+      el(Button,{variant:'primary',onClick:preview,disabled:!rules.length},'识别内链'),
       message && el(Notice,{status:'info',isDismissible:false},message),
       plan && plan.matches.length > 0 && el(wp.element.Fragment,{},el('p',{},'将添加 '+plan.matches.length+' 个链接：'),el('ul',{},plan.matches.map((m,i)=>el('li',{key:i,style:{marginBottom:'10px',overflowWrap:'anywhere'}},el('strong',{},m.keyword),' → ',m.url))),el(Button,{variant:'primary',onClick:apply},'确认添加'), ' ',el(Button,{variant:'secondary',onClick:()=>setPlan(null)},'取消'))
     )));

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Feishu Internal Links
  * Description: Sync keyword rules from a Feishu document and add internal links in the block editor.
- * Version: 0.4.0
+ * Version: 0.4.1
  * Requires at least: 6.2
  * Requires PHP: 7.4
  */
@@ -53,6 +53,9 @@ function fil_settings_page() {
   $value=isset($s[$key]) ? intval($s[$key]) : $setting[1];
   echo '<tr><th><label for="'.esc_attr($key).'">'.esc_html($setting[0]).'</label></th><td><input type="number" min="0" max="1000" step="1" required id="'.esc_attr($key).'" name="'.esc_attr($key).'" value="'.esc_attr($value).'"> <span>0 表示不限制；每个目标地址的数量包含已有链接</span></td></tr>';
  }
+ echo '<tr><th scope="row"><label for="same_site_only">仅匹配当前站点链接</label></th><td>';
+ echo '<input type="checkbox" id="same_site_only" name="same_site_only" value="1" aria-describedby="fil-site-scope" '.checked(!empty($s['same_site_only']), true, false).'>';
+ echo '<p class="description" id="fil-site-scope">按 WordPress 站点首页域名判断。带 www 与不带 www 视为同站，其他子域名单独判断。设置保存后重新打开文章编辑器即可生效。</p></td></tr>';
  $frequency=$s['sync_frequency'] ?? 'daily'; $day=isset($s['sync_day']) ? (int)$s['sync_day'] : 1; $time=$s['sync_time'] ?? '03:00';
  echo '<tr><th><label for="sync_frequency">自动同步频率</label></th><td><select id="sync_frequency" name="sync_frequency">';
  foreach (['hourly'=>'每小时','daily'=>'每天','weekly'=>'每周','off'=>'关闭'] as $value=>$label) echo '<option value="'.esc_attr($value).'" '.selected($frequency,$value,false).'>'.esc_html($label).'</option>';
@@ -78,7 +81,18 @@ add_action('admin_post_fil_save', function () {
  $frequency=sanitize_text_field(wp_unslash($_POST['sync_frequency'] ?? 'daily'));
  $day=wp_unslash($_POST['sync_day'] ?? '1'); $time=wp_unslash($_POST['sync_time'] ?? '03:00');
  if (!in_array($frequency, ['hourly','daily','weekly','off'], true) || !is_string($day) || !preg_match('/^[0-6]$/', $day) || !is_string($time) || !preg_match('/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/', $time)) fil_redirect('自动同步设置无效；设置未保存。');
- update_option(FIL_OPTION, ['app_id'=>sanitize_text_field(wp_unslash($_POST['app_id'] ?? '')), 'base'=>sanitize_text_field(wp_unslash($_POST['base'] ?? '')), 'table_id'=>sanitize_text_field(wp_unslash($_POST['table_id'] ?? '')), 'secret'=>$secret !== '' ? $secret : ($old['secret'] ?? ''), 'max_per_run'=>$limits['max_per_run'], 'max_per_target'=>$limits['max_per_target'], 'sync_frequency'=>$frequency, 'sync_day'=>(int)$day, 'sync_time'=>$time], false);
+ update_option(FIL_OPTION, [
+  'app_id' => sanitize_text_field(wp_unslash($_POST['app_id'] ?? '')),
+  'base' => sanitize_text_field(wp_unslash($_POST['base'] ?? '')),
+  'table_id' => sanitize_text_field(wp_unslash($_POST['table_id'] ?? '')),
+  'secret' => $secret !== '' ? $secret : ($old['secret'] ?? ''),
+  'max_per_run' => $limits['max_per_run'],
+  'max_per_target' => $limits['max_per_target'],
+  'same_site_only' => ($_POST['same_site_only'] ?? '') === '1',
+  'sync_frequency' => $frequency,
+  'sync_day' => (int)$day,
+  'sync_time' => $time,
+ ], false);
  wp_clear_scheduled_hook(FIL_CRON); fil_schedule_sync();
  fil_redirect('设置已保存。');
 });
@@ -181,7 +195,14 @@ add_action('admin_post_fil_sync', function () {
  fil_redirect(fil_run_sync());
 });
 add_action('enqueue_block_editor_assets', function () {
- wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.4.0', true);
+ wp_enqueue_script('fil-editor', plugins_url('editor.js',__FILE__), ['wp-plugins','wp-edit-post','wp-element','wp-components','wp-data','wp-blocks','wp-rich-text'], '0.4.1', true);
  $settings=get_option(FIL_OPTION, []);
- wp_add_inline_script('fil-editor', 'window.filData = '.wp_json_encode(['rules'=>get_option(FIL_RULES, []),'home'=>home_url('/'), 'maxPerRun'=>isset($settings['max_per_run']) ? (int)$settings['max_per_run'] : 10, 'maxPerTarget'=>isset($settings['max_per_target']) ? (int)$settings['max_per_target'] : 1], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT).';', 'before');
+ $editor_config = [
+  'rules' => get_option(FIL_RULES, []),
+  'home' => home_url('/'),
+  'maxPerRun' => (int)($settings['max_per_run'] ?? 10),
+  'maxPerTarget' => (int)($settings['max_per_target'] ?? 1),
+  'sameSiteOnly' => !empty($settings['same_site_only']),
+ ];
+ wp_add_inline_script('fil-editor', 'window.filData = '.wp_json_encode($editor_config, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT).';', 'before');
 });
