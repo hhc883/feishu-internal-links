@@ -2,11 +2,12 @@
 /**
  * Plugin Name: Feishu Internal Links
  * Description: Sync keyword rules from a Feishu document and add internal links in the block editor.
- * Version: 0.4.1
+ * Version: 0.5.0
  * Requires at least: 6.2
  * Requires PHP: 7.4
  */
 if (!defined('ABSPATH')) exit;
+require_once __DIR__.'/draft-link-check.php';
 const FIL_OPTION = 'fil_settings';
 const FIL_RULES = 'fil_rules';
 const FIL_CRON = 'fil_scheduled_sync_v2';
