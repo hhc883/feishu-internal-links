@@ -4,6 +4,10 @@ define('ABSPATH', __DIR__);
 define('MINUTE_IN_SECONDS', 60);
 
 function add_action() {}
+function home_url($path) { return 'https://www.example.net'.$path; }
+function get_option($name, $default) { return $GLOBALS['options'][$name] ?? $default; }
+function sanitize_text_field($value) { return is_string($value) ? trim(strip_tags($value)) : ''; }
+function add_settings_error($name, $code, $message) { $GLOBALS['settings_errors'][] = $code; }
 function wp_parse_url($url) { return parse_url($url); }
 function is_wp_error($response) { return $response === null; }
 function wp_remote_retrieve_response_code($response) { return $response['status']; }
@@ -94,5 +98,40 @@ $responses[$reverse['sitemap_url']] = [
 ];
 $responses['https://www.example.net/blog/guide/'] = ['status' => 200, 'body' => 'ok'];
 expect_same('https://www.example.net/blog/guide/', fil_draft_check_results([$alias], $reverse)[0]['url'], 'The other admin uses its own configured public hostname');
+
+$main_sitemap = 'https://www.example.net/sitemap.xml';
+$blog_sitemap = $reverse['sitemap_url'];
+$homepage = 'https://www.example.net/';
+$source_homepage = 'https://www.example.io/';
+$options = [FIL_DRAFT_LINK_OPTION => $reverse];
+$settings_errors = [];
+$submitted = array_merge($reverse, [
+ 'sitemap_url' => "  $blog_sitemap\r\n\r\n$main_sitemap\r\n$blog_sitemap  ",
+ 'on_missing' => 'unlink',
+]);
+$multi = fil_draft_sanitize_settings($submitted);
+expect_same("$blog_sitemap\n$main_sitemap", $multi['sitemap_url'], 'Keep unique URLs from a multiline settings submission');
+expect_same([], $settings_errors, 'Valid multiline settings save without errors');
+$invalid = array_merge($submitted, ['sitemap_url' => "$blog_sitemap\n$foreign"]);
+expect_same($reverse, fil_draft_sanitize_settings($invalid), 'A foreign URL must leave the old settings intact');
+expect_same(['fil_draft_invalid'], $settings_errors, 'Invalid sitemap settings should show an error');
+
+$responses[$main_sitemap] = [
+ 'status' => 200,
+ 'body' => '<urlset><url><loc>'.$homepage.'</loc></url></urlset>',
+];
+$responses[$homepage] = ['status' => 200, 'body' => 'homepage'];
+$other_source = 'https://www.example.io/blog/not-on-this-site/';
+$requests = [];
+$cache = [];
+$result = fil_draft_check_results([$alias, $source_homepage, $other_source], $multi);
+expect_same(['replace', 'replace', 'unlink'], array_column($result, 'action'), 'Match across both sources and unlink only after a complete miss');
+expect_same($homepage, $result[1]['url'], 'A homepage in the second sitemap matches the peer homepage');
+expect_same(1, count(array_keys($requests, $blog_sitemap, true)), 'Each configured sitemap is only fetched once');
+
+$cache = [];
+unset($responses[$blog_sitemap]);
+$result = fil_draft_check_results([$alias, $source_homepage, $other_source], $multi);
+expect_same(['unverified', 'replace', 'unverified'], array_column($result, 'action'), 'Continue matching if one sitemap fails and preserve uncertain links');
 
 echo "Draft-link checks passed.\n";

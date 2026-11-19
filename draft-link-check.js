@@ -126,7 +126,7 @@
     if (entry.action === 'replace') return '替换为 '+entry.url;
     if (entry.action === 'unlink') return '本站 sitemap 未收录，取消链接';
     if (entry.action === 'keep') return '本站 sitemap 未收录，保留原链接';
-    if (entry.reason === 'sitemap') return 'sitemap 未能完整读取，保留原链接';
+    if (entry.reason === 'sitemap') return '未能完整读取已配置的 sitemap，保留原链接';
     return '未能确认候选地址可访问，保留原链接';
   }
 

@@ -44,22 +44,33 @@ function fil_draft_settings() {
  ], get_option(FIL_DRAFT_LINK_OPTION, []));
 }
 
+function fil_draft_sitemap_urls($value) {
+ if (!is_string($value)) return [];
+ $urls = array_map('trim', preg_split('/\r\n|\r|\n/', $value));
+ return array_values(array_unique(array_filter($urls, 'strlen')));
+}
+
 function fil_draft_sanitize_settings($input) {
  $input = is_array($input) ? $input : [];
  $origin_input = trim(sanitize_text_field($input['public_origin'] ?? ''));
  $origin = fil_draft_url_parts($origin_input);
  $peer = strtolower(trim(sanitize_text_field($input['peer_hostname'] ?? '')));
- $sitemap = is_string($input['sitemap_url'] ?? null) ? trim($input['sitemap_url']) : '';
- $sitemap_parts = fil_draft_url_parts($sitemap);
+ $sitemaps = fil_draft_sitemap_urls($input['sitemap_url'] ?? '');
  $message = '';
  if (!$origin || !in_array($origin['path'] ?? '', ['', '/'], true) || isset($origin['query']) || isset($origin['fragment'])) {
   $message = '请填写完整的对外访问地址，例如 https://example.com，地址末尾无需加 /blog。';
  } elseif ($peer !== '' && (!filter_var($peer, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) || strpos($peer, '.') === false || fil_draft_hostname($peer) === fil_draft_hostname($origin['host']))) {
   $message = '请填写另一个站点的域名，例如 example.net。';
- } elseif ($sitemap !== '' && (!$sitemap_parts || isset($sitemap_parts['fragment']) || fil_draft_hostname($sitemap_parts['host']) !== fil_draft_hostname($origin['host']))) {
-  $message = '请填写本站 sitemap 的完整地址。';
- } elseif (($peer === '') !== ($sitemap === '')) {
-  $message = '启用草稿链接检查时，请同时填写对应站点域名和本站 sitemap。';
+ } elseif (($peer === '') !== empty($sitemaps)) {
+  $message = '启用草稿链接检查时，请同时填写对应站点域名和至少一个本站 sitemap 地址。';
+ } else {
+  foreach ($sitemaps as $sitemap) {
+   $parts = fil_draft_url_parts($sitemap);
+   if (!$parts || isset($parts['fragment']) || fil_draft_hostname($parts['host']) !== fil_draft_hostname($origin['host'])) {
+    $message = '本站 sitemap 地址必须是同站的完整网址，每行一个。';
+    break;
+   }
+  }
  }
 
  if ($message !== '') {
@@ -69,7 +80,7 @@ function fil_draft_sanitize_settings($input) {
  return [
   'public_origin' => fil_draft_origin($origin),
   'peer_hostname' => fil_draft_hostname($peer),
-  'sitemap_url' => $sitemap,
+  'sitemap_url' => implode("\n", $sitemaps),
   'on_missing' => ($input['on_missing'] ?? '') === 'unlink' ? 'unlink' : 'keep',
  ];
 }
@@ -88,7 +99,6 @@ function fil_draft_settings_page() {
  $fields = [
   'public_origin' => ['对外访问地址', '填入协议和正式域名，例如 https://example.com。草稿链接的 /blog/ 等原路径会保留。', 'url'],
   'peer_hostname' => ['对应站点域名', '填另一个后台对应的域名，例如 example.net。带 www 和不带 www 视为同站。', 'text'],
-  'sitemap_url' => ['本站 sitemap 地址', '填完整的 XML sitemap 或 sitemap 索引地址。清空对应域名和 sitemap 可停用草稿链接检查。', 'url'],
  ];
  echo '<div class="wrap"><h1>草稿链接检查</h1>';
  settings_errors();
@@ -100,11 +110,14 @@ function fil_draft_settings_page() {
   echo '<input class="regular-text" type="'.esc_attr($type).'" id="'.esc_attr($key).'" name="'.esc_attr(FIL_DRAFT_LINK_OPTION.'['.$key.']').'" value="'.esc_attr($settings[$key]).'" aria-describedby="'.esc_attr($key.'_help').'">';
   echo '<p class="description" id="'.esc_attr($key.'_help').'">'.esc_html($description).'</p></td></tr>';
  }
+ echo '<tr><th scope="row"><label for="sitemap_url">本站 sitemap 地址</label></th><td>';
+ echo '<textarea class="large-text" rows="4" id="sitemap_url" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[sitemap_url]" aria-describedby="sitemap_url_help">'.esc_textarea($settings['sitemap_url']).'</textarea>';
+ echo '<p class="description" id="sitemap_url_help">每行填写一个完整的 XML sitemap 或索引地址，可同时填主站和博客的地址。清空对应域名和 sitemap 可停用草稿链接检查。</p></td></tr>';
  echo '<tr><th scope="row"><label for="fil_draft_missing">本站 sitemap 未匹配时</label></th><td>';
  echo '<select id="fil_draft_missing" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[on_missing]">';
  echo '<option value="keep" '.selected($settings['on_missing'], 'keep', false).'>保留原链接</option>';
  echo '<option value="unlink" '.selected($settings['on_missing'], 'unlink', false).'>取消链接，保留文字和格式</option>';
- echo '</select><p class="description">只有完整读取 sitemap 后才能判定未匹配。检查失败时保留原链接。</p></td></tr></table>';
+ echo '</select><p class="description">只有完整读取所有已配置的 sitemap 后才能判定未匹配。无法确定时保留原链接。</p></td></tr></table>';
  submit_button();
  echo '</form></div>';
 }
@@ -157,12 +170,12 @@ function fil_draft_parse_sitemap($xml) {
  return $locations ? ['index' => $is_index, 'locations' => $locations] : null;
 }
 
-function fil_draft_sitemap_matches($sitemap, $hostname, $paths, $deadline) {
- $queue = [$sitemap];
+function fil_draft_sitemap_matches($sitemaps, $hostname, $paths, $deadline) {
+ $queue = $sitemaps;
  $seen = [];
  $missing = array_fill_keys($paths, true);
  $found = [];
- $complete = true;
+ $complete = !empty($queue);
  $size_limit = 6 * 1024 * 1024;
  for ($i = 0; $i < count($queue) && $missing; $i++) {
   $url = $queue[$i];
@@ -225,7 +238,8 @@ function fil_draft_check_results($links, $settings) {
  }
  $deadline = microtime(true) + 24;
  // Leave time to verify pages even if some sitemap files take a while.
- [$found, $complete] = fil_draft_sitemap_matches($settings['sitemap_url'], $hostname, array_keys($paths), $deadline - 6);
+ $sitemaps = fil_draft_sitemap_urls($settings['sitemap_url']);
+ [$found, $complete] = fil_draft_sitemap_matches($sitemaps, $hostname, array_keys($paths), $deadline - 6);
  $results = [];
  $verified = [];
  foreach ($candidates as [$link, $path, $url, $fragment]) {
@@ -285,7 +299,7 @@ add_action('enqueue_block_editor_assets', function () {
  if (!$settings['peer_hostname'] || !$settings['sitemap_url']) return;
  wp_enqueue_script('fil-draft-links', plugins_url('draft-link-check.js', __FILE__), [
   'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-components', 'wp-data', 'wp-rich-text',
- ], '0.5.0', true);
+ ], '0.5.1', true);
  wp_localize_script('fil-draft-links', 'filDraftLinks', [
   'origin' => $settings['public_origin'],
   'peerHostname' => $settings['peer_hostname'],
