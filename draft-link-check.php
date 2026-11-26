@@ -34,6 +34,35 @@ function fil_draft_path($parts) {
  return preg_replace_callback('/%[0-9a-f]{2}/i', function ($m) { return strtoupper($m[0]); }, $path);
 }
 
+function fil_draft_language_paths($post_id) {
+ if (!$post_id || !function_exists('pll_get_post_language') || !function_exists('pll_home_url') || !function_exists('pll_languages_list')) return null;
+ $language = pll_get_post_language($post_id);
+ $home = fil_draft_url_parts(get_option('home', ''));
+ if (!$language || !$home) return null;
+
+ $base = rtrim(fil_draft_path($home), '/').'/';
+ $prefixes = [];
+ foreach (pll_languages_list() as $slug) {
+  $localized_home = fil_draft_url_parts(pll_home_url($slug));
+  if (!$localized_home || isset($localized_home['query']) || fil_draft_hostname($localized_home['host']) !== fil_draft_hostname($home['host'])) continue;
+  $path = rtrim(fil_draft_path($localized_home), '/');
+  if ($path.'/' === $base || strpos($path, $base) !== 0 || strpos(substr($path, strlen($base)), '/') !== false) continue;
+  $prefixes[$slug] = $path.'/';
+ }
+ if (!isset($prefixes[$language])) return null;
+ return ['base' => $base, 'localized' => $prefixes[$language], 'prefixes' => array_values($prefixes)];
+}
+
+function fil_draft_localized_path($path, $language_paths) {
+ if (!$language_paths) return $path;
+ ['base' => $base, 'localized' => $localized, 'prefixes' => $prefixes] = $language_paths;
+ if ($path === $base || strpos($path, $base) !== 0) return $path;
+ foreach ($prefixes as $prefix) {
+  if (strpos($path.'/', $prefix) === 0) return $path;
+ }
+ return $localized.substr($path, strlen($base));
+}
+
 function fil_draft_settings() {
  $home = fil_draft_url_parts(home_url('/'));
  return array_merge([
@@ -90,17 +119,17 @@ add_action('admin_init', function () {
 });
 
 add_action('admin_menu', function () {
- add_options_page('草稿链接检查', '草稿链接检查', 'manage_options', 'fil-draft-links', 'fil_draft_settings_page');
+ add_options_page('文章链接检查', '文章链接检查', 'manage_options', 'fil-draft-links', 'fil_draft_settings_page');
 });
 
 function fil_draft_settings_page() {
  if (!current_user_can('manage_options')) return;
  $settings = fil_draft_settings();
  $fields = [
-  'public_origin' => ['对外访问地址', '填入协议和正式域名，例如 https://example.com。草稿链接的 /blog/ 等原路径会保留。', 'url'],
+  'public_origin' => ['对外访问地址', '填入协议和正式域名，例如 https://example.com。简体中文等语言目录根据文章语言匹配。', 'url'],
   'peer_hostname' => ['对应站点域名', '填另一个后台对应的域名，例如 example.net。带 www 和不带 www 视为同站。', 'text'],
  ];
- echo '<div class="wrap"><h1>草稿链接检查</h1>';
+ echo '<div class="wrap"><h1>文章链接检查</h1>';
  settings_errors();
  echo '<form action="options.php" method="post">';
  settings_fields(FIL_DRAFT_LINK_OPTION);
@@ -112,12 +141,12 @@ function fil_draft_settings_page() {
  }
  echo '<tr><th scope="row"><label for="sitemap_url">本站 sitemap 地址</label></th><td>';
  echo '<textarea class="large-text" rows="4" id="sitemap_url" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[sitemap_url]" aria-describedby="sitemap_url_help">'.esc_textarea($settings['sitemap_url']).'</textarea>';
- echo '<p class="description" id="sitemap_url_help">每行填写一个完整的 XML sitemap 或索引地址，可同时填主站和博客的地址。清空对应域名和 sitemap 可停用草稿链接检查。</p></td></tr>';
- echo '<tr><th scope="row"><label for="fil_draft_missing">本站 sitemap 未匹配时</label></th><td>';
+ echo '<p class="description" id="sitemap_url_help">每行填写一个完整的 XML sitemap 或索引地址，可同时填主站和博客各语言的地址。清空对应域名和 sitemap 可停用文章链接检查。</p></td></tr>';
+ echo '<tr><th scope="row"><label for="fil_draft_missing">未匹配链接的默认处理方式</label></th><td>';
  echo '<select id="fil_draft_missing" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[on_missing]">';
  echo '<option value="keep" '.selected($settings['on_missing'], 'keep', false).'>保留原链接</option>';
- echo '<option value="unlink" '.selected($settings['on_missing'], 'unlink', false).'>取消链接，保留文字和格式</option>';
- echo '</select><p class="description">只有完整读取所有已配置的 sitemap 后才能判定未匹配。无法确定时保留原链接。</p></td></tr></table>';
+ echo '<option value="unlink" '.selected($settings['on_missing'], 'unlink', false).'>移除链接（保留文字和格式）</option>';
+ echo '</select><p class="description">用于已确认未收录的链接。无法读取 sitemap 或确认候选地址可访问时默认保留。可在检查结果中逐条调整。</p></td></tr></table>';
  submit_button();
  echo '</form></div>';
 }
@@ -220,16 +249,18 @@ function fil_draft_sitemap_matches($sitemaps, $hostname, $paths, $deadline) {
  return [$found, $complete];
 }
 
-function fil_draft_check_results($links, $settings) {
+function fil_draft_check_results($links, $settings, $post_id = 0) {
  $site = fil_draft_url_parts($settings['public_origin']);
  $hostname = fil_draft_hostname($site['host']);
+ $language_paths = fil_draft_language_paths($post_id);
  $candidates = [];
  $paths = [];
  foreach ($links as $link) {
   $parts = fil_draft_url_parts($link);
   if (!$parts || !in_array(fil_draft_hostname($parts['host']), [$hostname, $settings['peer_hostname']], true)) continue;
-  if (fil_draft_origin($parts) === $settings['public_origin']) continue;
-  $path = fil_draft_path($parts);
+  $original_path = fil_draft_path($parts);
+  $path = fil_draft_localized_path($original_path, $language_paths);
+  if ($path === $original_path && fil_draft_origin($parts) === $settings['public_origin']) continue;
   $url = $settings['public_origin'].$path;
   if (isset($parts['query'])) $url .= '?'.$parts['query'];
   $fragment = isset($parts['fragment']) ? '#'.$parts['fragment'] : '';
@@ -272,14 +303,11 @@ add_action('wp_ajax_'.FIL_DRAFT_LINK_ACTION, function () {
  check_ajax_referer(FIL_DRAFT_LINK_ACTION, 'nonce');
  $post_id = absint($_POST['post_id'] ?? 0);
  if (!$post_id || !current_user_can('edit_post', $post_id)) {
-  wp_send_json_error(['message' => '你没有权限检查这篇草稿。'], 403);
- }
- if (!in_array(get_post_status($post_id), ['auto-draft', 'draft', 'pending'], true)) {
-  wp_send_json_error(['message' => '草稿链接检查适用于未发布的草稿。'], 400);
+  wp_send_json_error(['message' => '你没有权限检查这篇文章。'], 403);
  }
  $settings = fil_draft_settings();
  if (!$settings['peer_hostname'] || !$settings['sitemap_url'] || !fil_draft_url_parts($settings['public_origin'])) {
-  wp_send_json_error(['message' => '请先在「设置 → 草稿链接检查」中配置站点。'], 400);
+  wp_send_json_error(['message' => '请先在「设置 → 文章链接检查」中配置站点。'], 400);
  }
  $json = $_POST['links'] ?? '';
  $links = is_string($json) && strlen($json) <= 240000 ? json_decode(wp_unslash($json), true) : null;
@@ -288,10 +316,10 @@ add_action('wp_ajax_'.FIL_DRAFT_LINK_ACTION, function () {
  }
  foreach ($links as $link) {
   if (!is_string($link) || strlen($link) > 2048 || !fil_draft_url_parts($link)) {
-   wp_send_json_error(['message' => '草稿中有无法检查的地址。'], 400);
+   wp_send_json_error(['message' => '文章中有无法检查的地址。'], 400);
   }
  }
- wp_send_json_success(['results' => fil_draft_check_results(array_unique($links), $settings)]);
+ wp_send_json_success(['results' => fil_draft_check_results(array_unique($links), $settings, $post_id)]);
 });
 
 add_action('enqueue_block_editor_assets', function () {
@@ -299,10 +327,11 @@ add_action('enqueue_block_editor_assets', function () {
  if (!$settings['peer_hostname'] || !$settings['sitemap_url']) return;
  wp_enqueue_script('fil-draft-links', plugins_url('draft-link-check.js', __FILE__), [
   'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-components', 'wp-data', 'wp-rich-text',
- ], '0.5.1', true);
+ ], '0.5.4', true);
  wp_localize_script('fil-draft-links', 'filDraftLinks', [
   'origin' => $settings['public_origin'],
   'peerHostname' => $settings['peer_hostname'],
+  'languagePaths' => fil_draft_language_paths(get_post()->ID ?? 0),
   'action' => FIL_DRAFT_LINK_ACTION,
   'nonce' => wp_create_nonce(FIL_DRAFT_LINK_ACTION),
   'endpoint' => admin_url('admin-ajax.php'),

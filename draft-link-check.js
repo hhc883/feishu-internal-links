@@ -3,10 +3,9 @@
 
   const el = wp.element.createElement;
   const { useState } = wp.element;
-  const { Button, Notice, Spinner } = wp.components;
+  const { Button, Notice, SelectControl, Spinner } = wp.components;
   const { PluginSidebar, PluginSidebarMoreMenuItem } = wp.editPost;
   const blockStore = 'core/block-editor';
-  const draftStatuses = ['auto-draft', 'draft', 'pending'];
   const richContentBlocks = new Set([
     'core/paragraph', 'core/heading', 'core/list-item', 'core/list',
     'core/freeform', 'core/verse', 'core/preformatted',
@@ -18,12 +17,19 @@
   const comparableHost = host => host.replace(/^www\./, '');
   const siteHosts = new Set([comparableHost(origin.hostname), config.peerHostname]);
 
+  function needsLanguagePath(pathname) {
+    if (!config.languagePaths) return false;
+    const { base, prefixes } = config.languagePaths;
+    const path = pathname.replace(/%[0-9a-f]{2}/gi, escape => escape.toUpperCase());
+    return path !== base && path.startsWith(base) && !prefixes.some(prefix => (path + '/').startsWith(prefix));
+  }
+
   function candidateLink(href) {
     if (!/^(?:https?:)?\/\//i.test(href.trim())) return '';
     try {
       const url = new URL(href, origin);
       if (url.username || url.password || !siteHosts.has(comparableHost(url.hostname))) return '';
-      return url.origin === origin.origin ? '' : url.href;
+      return url.origin !== origin.origin || needsLanguagePath(url.pathname) ? url.href : '';
     } catch (_) {
       return '';
     }
@@ -90,66 +96,58 @@
     return updates;
   }
 
-  function correctionPlan(blocks, results) {
+  function collectResults(blocks, results) {
     const byLink = new Map(results.map(result => [result.link, result]));
     const entries = [];
-    const updates = scanLinks(blocks, (anchor, key) => {
+    scanLinks(blocks, (anchor, key) => {
       const result = byLink.get(key);
       if (!result) return false;
       entries.push({
         ...result,
+        action: result.action === 'unverified' ? 'keep' : result.action,
         before: anchor.getAttribute('href'),
         label: anchor.textContent.trim(),
       });
-      if (result.action === 'replace') {
-        anchor.setAttribute('href', result.url);
-        return true;
-      }
-      if (result.action === 'unlink') {
-        anchor.replaceWith(...anchor.childNodes);
-        return true;
-      }
       return false;
     });
-    return { entries, updates };
+    return entries;
   }
 
-  function readDraft() {
+  function readPost() {
     const editor = wp.data.select('core/editor');
     const id = editor.getCurrentPostId();
-    const status = editor.getEditedPostAttribute('status');
     const blocks = wp.data.select(blockStore).getBlocks();
-    return { id, status, blocks, snapshot: JSON.stringify(blocks) };
+    return { id, blocks, snapshot: JSON.stringify(blocks) };
   }
 
   function describeResult(entry) {
     if (entry.action === 'replace') return '替换为 '+entry.url;
-    if (entry.action === 'unlink') return '本站 sitemap 未收录，取消链接';
-    if (entry.action === 'keep') return '本站 sitemap 未收录，保留原链接';
-    if (entry.reason === 'sitemap') return '未能完整读取已配置的 sitemap，保留原链接';
-    return '未能确认候选地址可访问，保留原链接';
+    if (entry.reason === 'missing') return '本站 sitemap 未收录';
+    if (entry.reason === 'sitemap') return '未能完整读取已配置的 sitemap';
+    return '未能确认候选地址可访问';
   }
 
   function Panel() {
     const [plan, setPlan] = useState(null);
     const [busy, setBusy] = useState(false);
     const [message, setMessage] = useState('');
+    const changeCount = plan ? plan.entries.filter(entry => entry.action !== 'keep').length : 0;
 
     async function preview() {
       setPlan(null);
       setMessage('');
-      const draft = readDraft();
-      if (!draft.id || !draftStatuses.includes(draft.status)) {
-        setMessage('请在未发布的文章草稿中使用。');
+      const post = readPost();
+      if (!post.id) {
+        setMessage('请先保存文章，再检查链接。');
         return;
       }
       const links = new Set();
-      scanLinks(draft.blocks, (_anchor, key) => {
+      scanLinks(post.blocks, (_anchor, key) => {
         links.add(key);
         return false;
       });
       if (!links.size) {
-        setMessage('没有找到需要检查的跨站链接或域名变体。');
+        setMessage('没有找到需要检查的链接。');
         return;
       }
       setBusy(true);
@@ -157,7 +155,7 @@
         const body = new URLSearchParams({
           action: config.action,
           nonce: config.nonce,
-          post_id: draft.id,
+          post_id: post.id,
           links: JSON.stringify(Array.from(links)),
         });
         const response = await fetch(config.endpoint, { method: 'POST', credentials: 'same-origin', body });
@@ -165,12 +163,16 @@
         if (!response.ok || !data.success) {
           throw new Error(data.data?.message || '检查失败，请刷新后重试。');
         }
-        const fresh = readDraft();
-        if (fresh.id !== draft.id || fresh.snapshot !== draft.snapshot || !draftStatuses.includes(fresh.status)) {
-          setMessage('草稿已变化，请重新检查。');
+        const fresh = readPost();
+        if (fresh.id !== post.id || fresh.snapshot !== post.snapshot) {
+          setMessage('文章内容已变化，请重新检查。');
           return;
         }
-        setPlan({ ...correctionPlan(fresh.blocks, data.data.results), id: fresh.id, snapshot: fresh.snapshot });
+        if (!data.data.results.length) {
+          setMessage('没有找到需要检查的链接。');
+          return;
+        }
+        setPlan({ entries: collectResults(fresh.blocks, data.data.results), id: fresh.id, snapshot: fresh.snapshot });
       } catch (error) {
         setMessage(error.message || '检查失败，请重试。');
       } finally {
@@ -178,37 +180,80 @@
       }
     }
 
+    function chooseAction(index, action) {
+      setPlan(current => current && {
+        ...current,
+        entries: current.entries.map((entry, position) => position === index ? { ...entry, action } : entry),
+      });
+    }
+
     function apply() {
-      const fresh = readDraft();
-      if (!plan || fresh.id !== plan.id || fresh.snapshot !== plan.snapshot || !draftStatuses.includes(fresh.status)) {
+      const fresh = readPost();
+      if (!plan || fresh.id !== plan.id || fresh.snapshot !== plan.snapshot) {
         setPlan(null);
-        setMessage('草稿已变化，请重新检查。');
+        setMessage('文章内容已变化，请重新检查。');
+        return;
+      }
+      // The unchanged block snapshot keeps each choice tied to its original occurrence.
+      let index = 0;
+      const updates = scanLinks(fresh.blocks, (anchor, key) => {
+        const entry = plan.entries[index];
+        if (entry?.link !== key) return false;
+        index++;
+        if (entry.action === 'replace') {
+          anchor.setAttribute('href', entry.url);
+          return true;
+        }
+        if (entry.action === 'unlink') {
+          anchor.replaceWith(...anchor.childNodes);
+          return true;
+        }
+        return false;
+      });
+      if (index !== plan.entries.length) {
+        setPlan(null);
+        setMessage('链接已变化，请重新检查。');
         return;
       }
       const { updateBlockAttributes } = wp.data.dispatch(blockStore);
-      plan.updates.forEach(({ id, attributes }) => updateBlockAttributes(id, attributes));
-      const count = plan.entries.filter(entry => ['replace', 'unlink'].includes(entry.action)).length;
+      updates.forEach(({ id, attributes }) => updateBlockAttributes(id, attributes));
       setPlan(null);
-      setMessage('已处理 '+count+' 条链接，请检查并保存草稿。');
+      setMessage('已处理 '+changeCount+' 条链接，请检查并保存文章。');
     }
 
-    const title = '草稿链接检查';
+    const title = '文章链接检查';
     return el(wp.element.Fragment, null,
       el(PluginSidebarMoreMenuItem, { target: 'fil-draft-sidebar' }, title),
       el(PluginSidebar, { name: 'fil-draft-sidebar', title },
         el('div', { style: { padding: '16px', overflowWrap: 'anywhere' } },
-          el('p', null, '核对正文中指向 '+config.peerHostname+' 或本站其他域名写法的链接。'),
-          el(Button, { variant: 'primary', onClick: preview, disabled: busy }, '检查草稿链接'),
+          el('p', null, '核对正文中指向 '+config.peerHostname+' 的链接，以及域名或语言路径需要调整的本站链接。'),
+          el(Button, { variant: 'primary', onClick: preview, disabled: busy }, '检查文章链接'),
           busy && el(Spinner),
           message && el(Notice, { status: 'info', isDismissible: false }, message),
           plan && el(wp.element.Fragment, null,
             el('p', null, '检查结果（'+plan.entries.length+' 条）'),
-            el('ul', null, plan.entries.map((entry, index) => el('li', { key: index, style: { marginBottom: '12px' } },
-              entry.label && el('strong', null, entry.label),
-              el('div', null, entry.before),
-              el('div', null, describeResult(entry))
-            ))),
-            plan.updates.length > 0 && el(Button, { variant: 'primary', onClick: apply }, '确认处理')
+            el('ul', null, plan.entries.map((entry, index) => {
+              const matched = entry.action === 'replace';
+              const color = matched ? '#006b3c' : '#a12328';
+              return el('li', { key: index, style: { marginBottom: '12px' } },
+                entry.label && el('strong', null, entry.label),
+                el('div', null, entry.before),
+                el('div', { style: { color } },
+                  el('strong', null, matched ? '匹配成功' : '匹配失败'),
+                  ' · '+describeResult(entry)
+                ),
+                !matched && el(SelectControl, {
+                  label: '处理方式',
+                  value: entry.action,
+                  options: [
+                    { value: 'keep', label: '保留原链接' },
+                    { value: 'unlink', label: '移除链接（保留文字和格式）' },
+                  ],
+                  onChange: action => chooseAction(index, action),
+                })
+              );
+            })),
+            changeCount > 0 && el(Button, { variant: 'primary', onClick: apply }, '确认处理')
           )
         )
       )
