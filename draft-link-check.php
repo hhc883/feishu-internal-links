@@ -46,11 +46,37 @@ function fil_draft_language_paths($post_id) {
   $localized_home = fil_draft_url_parts(pll_home_url($slug));
   if (!$localized_home || isset($localized_home['query']) || fil_draft_hostname($localized_home['host']) !== fil_draft_hostname($home['host'])) continue;
   $path = rtrim(fil_draft_path($localized_home), '/');
-  if ($path.'/' === $base || strpos($path, $base) !== 0 || strpos(substr($path, strlen($base)), '/') !== false) continue;
+  if ($path.'/' === $base) { $prefixes[$slug] = $base; continue; }
+  if (strpos($path, $base) !== 0 || strpos(substr($path, strlen($base)), '/') !== false) continue;
   $prefixes[$slug] = $path.'/';
  }
  if (!isset($prefixes[$language])) return null;
- return ['base' => $base, 'localized' => $prefixes[$language], 'prefixes' => array_values($prefixes)];
+ return ['base' => $base, 'localized' => $prefixes[$language], 'prefixes' => array_values(array_filter($prefixes, function ($prefix) use ($base) { return $prefix !== $base; }))];
+}
+
+// Cross-site URLs may contain a language that is not enabled on this site.
+function fil_draft_cross_site_path($path, $language_paths) {
+ if (!$language_paths) return $path;
+ $base = $language_paths['base'];
+ $is_blog = $base !== '/' && (strpos($path, $base) === 0 || rtrim($path, '/') === rtrim($base, '/'));
+ $root = $is_blog ? $base : '/';
+ $rest = ltrim(substr($path, strlen(rtrim($root, '/'))), '/');
+ $segments = ['zh-cn', 'zh-tw'];
+ foreach ($language_paths['prefixes'] as $prefix) {
+  $segment = trim(substr($prefix, strlen($base)), '/');
+  if ($segment !== '') $segments[] = $segment;
+ }
+ foreach (array_unique($segments) as $segment) {
+  if ($rest === $segment || strpos($rest, $segment.'/') === 0) {
+   $rest = substr($rest, strlen($segment));
+   $rest = ltrim($rest, '/');
+   break;
+  }
+ }
+ $language = substr($language_paths['localized'], strlen($base));
+ $target = $root.$language.$rest;
+ if ($rest === '' && substr($path, -1) !== '/') $target = rtrim($target, '/');
+ return $target ?: '/';
 }
 
 function fil_draft_localized_path($path, $language_paths) {
@@ -79,12 +105,31 @@ function fil_draft_sitemap_urls($value) {
  return array_values(array_unique(array_filter($urls, 'strlen')));
 }
 
+// Each mapping names the original URL and one exact destination URL.
+function fil_draft_parse_mappings($value, $peer, $hostname) {
+ $mappings = [];
+ foreach (preg_split('/\r\n|\r|\n/', (string)$value) as $line) {
+  if (trim($line) === '') continue;
+  $pair = preg_split('/\s*=>\s*/', trim($line));
+  if (count($pair) !== 2) return null;
+  [$source, $target] = $pair;
+  $from = fil_draft_url_parts($source);
+  $to = fil_draft_url_parts($target);
+  if (!$from || !$to || fil_draft_hostname($from['host']) !== $peer || fil_draft_hostname($to['host']) !== $hostname || isset($from['query']) || isset($from['fragment']) || isset($to['query']) || isset($to['fragment'])) return null;
+  $key = fil_draft_path($from);
+  if (isset($mappings[$key])) return null;
+  $mappings[$key] = fil_draft_path($to);
+ }
+ return $mappings;
+}
+
 function fil_draft_sanitize_settings($input) {
  $input = is_array($input) ? $input : [];
  $origin_input = trim(sanitize_text_field($input['public_origin'] ?? ''));
  $origin = fil_draft_url_parts($origin_input);
  $peer = strtolower(trim(sanitize_text_field($input['peer_hostname'] ?? '')));
  $sitemaps = fil_draft_sitemap_urls($input['sitemap_url'] ?? '');
+ $mapping_text = trim((string)($input['url_mappings'] ?? ''));
  $message = '';
  if (!$origin || !in_array($origin['path'] ?? '', ['', '/'], true) || isset($origin['query']) || isset($origin['fragment'])) {
   $message = '请填写完整的对外访问地址，例如 https://example.com，地址末尾无需加 /blog。';
@@ -100,18 +145,23 @@ function fil_draft_sanitize_settings($input) {
     break;
    }
   }
+  if ($message === '' && $mapping_text !== '' && (!$peer || fil_draft_parse_mappings($mapping_text, fil_draft_hostname($peer), fil_draft_hostname($origin['host'])) === null)) {
+   $message = '链接映射格式有误：每行填写“对应站点完整网址 => 本站完整网址”，网址不含参数或锚点，且来源不能重复。';
+  }
  }
 
  if ($message !== '') {
   add_settings_error(FIL_DRAFT_LINK_OPTION, 'fil_draft_invalid', $message);
   return fil_draft_settings();
  }
- return [
+ $saved = [
   'public_origin' => fil_draft_origin($origin),
   'peer_hostname' => fil_draft_hostname($peer),
   'sitemap_url' => implode("\n", $sitemaps),
   'on_missing' => ($input['on_missing'] ?? '') === 'unlink' ? 'unlink' : 'keep',
  ];
+ if ($mapping_text !== '') $saved['url_mappings'] = $mapping_text;
+ return $saved;
 }
 
 add_action('admin_init', function () {
@@ -142,6 +192,9 @@ function fil_draft_settings_page() {
  echo '<tr><th scope="row"><label for="sitemap_url">本站 sitemap 地址</label></th><td>';
  echo '<textarea class="large-text" rows="4" id="sitemap_url" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[sitemap_url]" aria-describedby="sitemap_url_help">'.esc_textarea($settings['sitemap_url']).'</textarea>';
  echo '<p class="description" id="sitemap_url_help">每行填写一个完整的 XML sitemap 或索引地址，可同时填主站和博客各语言的地址。清空对应域名和 sitemap 可停用文章链接检查。</p></td></tr>';
+ echo '<tr><th scope="row"><label for="url_mappings">已知链接对应关系</label></th><td>';
+ echo '<textarea class="large-text" rows="4" id="url_mappings" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[url_mappings]">'.esc_textarea($settings['url_mappings'] ?? '').'</textarea>';
+ echo '<p class="description">每行一组：对应站点完整网址 =&gt; 本站完整网址。不填写参数或锚点；替换时保留原链接的参数和锚点。目标仍须在 sitemap 中且可访问。</p></td></tr>';
  echo '<tr><th scope="row"><label for="fil_draft_missing">未匹配链接的默认处理方式</label></th><td>';
  echo '<select id="fil_draft_missing" name="'.esc_attr(FIL_DRAFT_LINK_OPTION).'[on_missing]">';
  echo '<option value="keep" '.selected($settings['on_missing'], 'keep', false).'>保留原链接</option>';
@@ -204,6 +257,7 @@ function fil_draft_sitemap_matches($sitemaps, $hostname, $paths, $deadline) {
  $seen = [];
  $missing = array_fill_keys($paths, true);
  $found = [];
+ $listed = [];
  $complete = !empty($queue);
  $size_limit = 6 * 1024 * 1024;
  for ($i = 0; $i < count($queue) && $missing; $i++) {
@@ -239,6 +293,7 @@ function fil_draft_sitemap_matches($sitemaps, $hostname, $paths, $deadline) {
     $queue[] = $location;
    } else {
     $path = fil_draft_path($parts);
+    if (count($listed) < 50000) $listed[$path] = true;
     if (isset($missing[$path])) {
      $found[$path] = true;
      unset($missing[$path]);
@@ -246,40 +301,93 @@ function fil_draft_sitemap_matches($sitemaps, $hostname, $paths, $deadline) {
    }
   }
  }
- return [$found, $complete];
+ return [$found, $complete, array_keys($listed)];
+}
+
+function fil_draft_suggestions($path, $listed, $language_paths) {
+ $base = $language_paths['base'] ?? '/blog/';
+ $is_blog = strpos($path, $base) === 0 && $base !== '/';
+ $prefixes = [];
+ foreach (['zh-cn', 'zh-tw'] as $segment) {
+  $prefixes[] = '/'.$segment.'/';
+  if ($base !== '/') $prefixes[] = $base.$segment.'/';
+ }
+ if ($language_paths) {
+  foreach ($language_paths['prefixes'] as $prefix) {
+   $prefixes[] = $prefix;
+   if ($base !== '/') $prefixes[] = '/'.substr($prefix, strlen($base));
+  }
+ }
+ $language = '';
+ foreach ($prefixes as $prefix) if (strpos($path.'/', $prefix) === 0) { $language = $prefix; break; }
+ $tokens = function ($value) {
+  $slug = basename(rtrim($value, '/'));
+  $words = preg_split('/[^a-z0-9]+/', strtolower(rawurldecode($slug)), -1, PREG_SPLIT_NO_EMPTY);
+  return array_values(array_unique(array_map(function ($word) { return $word === 'proxies' ? 'proxy' : $word; }, $words)));
+ };
+ $source = $tokens($path);
+ if (count($source) < 2) return [];
+ $scores = [];
+ foreach ($listed as $candidate) {
+  if ($candidate === $path || ($base !== '/' && (strpos($candidate, $base) === 0) !== $is_blog)) continue;
+  $candidate_language = '';
+  foreach ($prefixes as $prefix) if (strpos($candidate.'/', $prefix) === 0) { $candidate_language = $prefix; break; }
+  if ($candidate_language !== $language) continue;
+  $target = $tokens($candidate);
+  $intersection = count(array_intersect($source, $target));
+  $union = count(array_unique(array_merge($source, $target)));
+  if ($intersection < 2 || !$union || $intersection / $union < 0.4) continue;
+  $scores[$candidate] = $intersection / $union;
+ }
+ arsort($scores, SORT_NUMERIC);
+ return array_slice(array_keys($scores), 0, 3);
 }
 
 function fil_draft_check_results($links, $settings, $post_id = 0) {
  $site = fil_draft_url_parts($settings['public_origin']);
  $hostname = fil_draft_hostname($site['host']);
  $language_paths = fil_draft_language_paths($post_id);
+ $mappings = fil_draft_parse_mappings($settings['url_mappings'] ?? '', $settings['peer_hostname'], $hostname) ?? [];
  $candidates = [];
  $paths = [];
  foreach ($links as $link) {
   $parts = fil_draft_url_parts($link);
   if (!$parts || !in_array(fil_draft_hostname($parts['host']), [$hostname, $settings['peer_hostname']], true)) continue;
   $original_path = fil_draft_path($parts);
-  $path = fil_draft_localized_path($original_path, $language_paths);
+  $peer_link = fil_draft_hostname($parts['host']) === $settings['peer_hostname'];
+  $mapped = $peer_link && isset($mappings[$original_path]);
+  $path = $peer_link
+   ? fil_draft_cross_site_path($mapped ? $mappings[$original_path] : $original_path, $language_paths)
+   : fil_draft_localized_path($original_path, $language_paths);
   if ($path === $original_path && fil_draft_origin($parts) === $settings['public_origin']) continue;
-  $url = $settings['public_origin'].$path;
-  if (isset($parts['query'])) $url .= '?'.$parts['query'];
+  $query = isset($parts['query']) ? '?'.$parts['query'] : '';
   $fragment = isset($parts['fragment']) ? '#'.$parts['fragment'] : '';
   $paths[$path] = true;
-  $candidates[] = [$link, $path, $url, $fragment];
+  $candidates[] = [$link, $path, $query, $fragment];
  }
  $deadline = microtime(true) + 24;
  // Leave time to verify pages even if some sitemap files take a while.
  $sitemaps = fil_draft_sitemap_urls($settings['sitemap_url']);
- [$found, $complete] = fil_draft_sitemap_matches($sitemaps, $hostname, array_keys($paths), $deadline - 6);
+ [$found, $complete, $listed] = fil_draft_sitemap_matches($sitemaps, $hostname, array_keys($paths), $deadline - 6);
  $results = [];
  $verified = [];
- foreach ($candidates as [$link, $path, $url, $fragment]) {
+ foreach ($candidates as [$link, $path, $query, $fragment]) {
+  $url = $settings['public_origin'].$path.$query;
   if (!isset($found[$path])) {
-   $results[] = [
+   $suggestions = [];
+   foreach (fil_draft_suggestions($path, $listed, $language_paths) as $suggested_path) {
+    $suggested_url = $settings['public_origin'].$suggested_path.$query;
+    $response = fil_draft_get($suggested_url, $hostname, $deadline, 4096, $suggested_path);
+    $status = $response ? (int)wp_remote_retrieve_response_code($response) : 0;
+    if ($status >= 200 && $status < 300) $suggestions[] = $suggested_url.$fragment;
+   }
+   $result = [
     'link' => $link,
-    'action' => $complete ? $settings['on_missing'] : 'unverified',
+    'action' => $suggestions ? 'keep' : ($complete ? $settings['on_missing'] : 'unverified'),
     'reason' => $complete ? 'missing' : 'sitemap',
    ];
+   if ($suggestions) $result['suggestions'] = $suggestions;
+   $results[] = $result;
    continue;
   }
   if (!isset($verified[$url])) {
@@ -327,7 +435,7 @@ add_action('enqueue_block_editor_assets', function () {
  if (!$settings['peer_hostname'] || !$settings['sitemap_url']) return;
  wp_enqueue_script('fil-draft-links', plugins_url('draft-link-check.js', __FILE__), [
   'wp-plugins', 'wp-edit-post', 'wp-element', 'wp-components', 'wp-data', 'wp-rich-text',
- ], '0.5.4', true);
+ ], '0.5.7', true);
  wp_localize_script('fil-draft-links', 'filDraftLinks', [
   'origin' => $settings['public_origin'],
   'peerHostname' => $settings['peer_hostname'],

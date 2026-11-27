@@ -19,7 +19,8 @@
 
   function needsLanguagePath(pathname) {
     if (!config.languagePaths) return false;
-    const { base, prefixes } = config.languagePaths;
+    const { base, prefixes, localized } = config.languagePaths;
+    if (localized === base) return false;
     const path = pathname.replace(/%[0-9a-f]{2}/gi, escape => escape.toUpperCase());
     return path !== base && path.startsWith(base) && !prefixes.some(prefix => (path + '/').startsWith(prefix));
   }
@@ -180,10 +181,17 @@
       }
     }
 
-    function chooseAction(index, action) {
+    function chooseAction(index, value) {
       setPlan(current => current && {
         ...current,
-        entries: current.entries.map((entry, position) => position === index ? { ...entry, action } : entry),
+        entries: current.entries.map((entry, position) => {
+          if (position !== index) return entry;
+          if (value.startsWith('candidate:')) {
+            const url = entry.suggestions?.[Number(value.slice(10))];
+            return url ? { ...entry, action: 'replace', url, choice: value } : entry;
+          }
+          return { ...entry, action: value, choice: value };
+        }),
       });
     }
 
@@ -233,7 +241,7 @@
           plan && el(wp.element.Fragment, null,
             el('p', null, '检查结果（'+plan.entries.length+' 条）'),
             el('ul', null, plan.entries.map((entry, index) => {
-              const matched = entry.action === 'replace';
+              const matched = entry.action === 'replace' && !entry.suggestions?.length;
               const color = matched ? '#006b3c' : '#a12328';
               return el('li', { key: index, style: { marginBottom: '12px' } },
                 entry.label && el('strong', null, entry.label),
@@ -244,10 +252,11 @@
                 ),
                 !matched && el(SelectControl, {
                   label: '处理方式',
-                  value: entry.action,
+                  value: entry.choice || entry.action,
                   options: [
                     { value: 'keep', label: '保留原链接' },
                     { value: 'unlink', label: '移除链接（保留文字和格式）' },
+                    ...(entry.suggestions || []).map((url, i) => ({ value: 'candidate:'+i, label: '使用候选：'+url })),
                   ],
                   onChange: action => chooseAction(index, action),
                 })

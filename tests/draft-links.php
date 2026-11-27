@@ -16,7 +16,7 @@ function wp_send_json_error($data, $status) { throw new TestAjaxResponse(json_en
 function home_url($path) { return 'https://www.example.net'.$path; }
 function get_option($name, $default) { return $GLOBALS['options'][$name] ?? $default; }
 function pll_get_post_language($post_id) { return [1 => 'zh', 2 => 'en', 4 => 'zh-tw'][$post_id] ?? false; }
-function pll_languages_list() { return ['en', 'zh', 'zh-tw']; }
+function pll_languages_list() { return $GLOBALS['test_languages'] ?? ['en', 'zh', 'zh-tw']; }
 function pll_home_url($language) {
  return $GLOBALS['options']['home'].'/'.(['zh' => 'zh-cn/', 'zh-tw' => 'zh-tw/'][$language] ?? '');
 }
@@ -161,6 +161,7 @@ $responses[$blog_sitemap] = [
 ];
 $responses[$localized_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$chinese_page.'</loc></url></urlset>'];
 $responses[$chinese_page.'?ref=draft'] = ['status' => 200];
+$responses[$chinese_page] = ['status' => 200];
 $responses[$traditional_page] = ['status' => 200];
 $from_english = 'https://www.example.io/blog/guide/?ref=draft#details';
 $from_chinese = 'https://www.example.io/blog/zh-cn/guide/?ref=draft#details';
@@ -168,11 +169,11 @@ $from_traditional = 'https://www.example.io/blog/zh-tw/guide/';
 $from_english_only = 'https://www.example.io/blog/english-only/';
 $cache = [];
 $result = fil_draft_check_results([$from_english, $from_chinese, $from_traditional, $from_english_only, $source_homepage], $localized, 1);
-expect_same(['replace', 'replace', 'replace', 'keep', 'replace'], array_column($result, 'action'), 'A Chinese draft matches Chinese paths and retains the configured behavior for missing translations');
+expect_same(['replace', 'replace', 'replace', 'keep', 'keep'], array_column($result, 'action'), 'A Chinese draft matches Chinese paths and retains the configured behavior for missing translations');
 expect_same($chinese_page.'?ref=draft#details', $result[0]['url'], 'Use the language URL directory and preserve query and fragment');
 expect_same($result[0]['url'], $result[1]['url'], 'Do not duplicate existing language prefixes');
-expect_same($traditional_page, $result[2]['url'], 'Preserve an explicitly selected other language');
-expect_same($homepage, $result[4]['url'], 'The WordPress language does not rewrite the main site homepage');
+expect_same($chinese_page, $result[2]['url'], 'Cross-site links follow the current article language');
+expect_same('missing', $result[4]['reason'], 'Do not silently substitute a homepage in another language');
 expect_same($english_page, fil_draft_check_results([$alias], $localized, 2)[0]['url'], 'Default-language drafts still match unprefixed paths');
 expect_same($english_page, fil_draft_check_results([$alias], $localized, 3)[0]['url'], 'Drafts without a saved language still match unprefixed paths');
 $same_site_english = $english_page.'?ref=draft#details';
@@ -206,4 +207,89 @@ try {
  expect_same(403, $response->getCode(), 'Require edit permission for the requested article');
 }
 
+$cache = [];
+$main_home = 'https://www.example.net/zh-cn/';
+$main_isp = 'https://www.example.net/zh-cn/isp-proxies/';
+$main_dc = 'https://www.example.net/zh-cn/datacenter-proxies/';
+$responses[$main_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$main_home.'</loc></url><url><loc>'.$main_isp.'</loc></url><url><loc>'.$main_dc.'</loc></url></urlset>'];
+$responses[$main_home] = ['status' => 200, 'body' => 'ok'];
+$responses[$main_isp] = ['status' => 200, 'body' => 'ok'];
+$responses[$main_dc] = ['status' => 200, 'body' => 'ok'];
+$result = fil_draft_check_results(['https://www.example.io/', 'https://www.example.io/isp-proxies/', 'https://www.example.io/datacenter-proxies/'], $localized, 1);
+expect_same([$main_home, $main_isp, $main_dc], array_column($result, 'url'), 'A Chinese article must match localized main-site pages listed in the sitemap');
+$responses[$main_isp.'?ref=test'] = ['status' => 200, 'body' => 'ok'];
+$result = fil_draft_check_results(['https://www.example.io/isp-proxies/?ref=test#detail', 'https://www.example.io/zh-cn/isp-proxies/'], $localized, 1);
+expect_same([$main_isp.'?ref=test#detail', $main_isp], array_column($result, 'url'), 'Keep query and fragment and avoid duplicating existing language prefixes');
+$cache = [];
+unset($responses[$blog_sitemap]);
+$responses[$main_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>https://www.example.net/isp-proxies/</loc></url></urlset>'];
+expect_same('unverified', fil_draft_check_results(['https://www.example.io/isp-proxies/'], $localized, 1)[0]['action'], 'Do not fall back to the unlocalized page when a sitemap could not be read');
+$cache = [];
+$changed = 'https://www.example.net/zh-cn/isp-proxy-service/';
+$responses[$main_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$changed.'</loc></url><url><loc>https://www.example.net/zh-tw/isp-proxy-service/</loc></url></urlset>'];
+$responses[$blog_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$english_page.'</loc></url></urlset>'];
+$responses[$changed.'?ref=test'] = ['status' => 200, 'body' => 'ok'];
+$responses[$changed] = ['status' => 200, 'body' => 'ok'];
+$source_changed = 'https://www.example.io/isp-proxies/?ref=test#detail';
+$result = fil_draft_check_results([$source_changed], $localized, 1)[0];
+expect_same('keep', $result['action'], 'Similar pages must not be selected automatically even when missing links default to unlink');
+expect_same([$changed.'?ref=test#detail'], $result['suggestions'], 'Suggest the accessible matching-language sitemap path and preserve parameters');
+$mapped = array_merge($localized, ['url_mappings' => 'https://www.example.io/isp-proxies/ => '.$changed]);
+$result = fil_draft_check_results([$source_changed], $mapped, 1)[0];
+expect_same('replace', $result['action'], 'An explicit mapping can be used as an exact verified match');
+expect_same($changed.'?ref=test#detail', $result['url'], 'A mapped link preserves parameters and fragments');
+$invalid_mapping = array_merge($submitted, ['url_mappings' => 'https://www.example.io/isp-proxies/ => https://unrelated.test/isp-proxies/']);
+$settings_errors = [];
+expect_same(fil_draft_settings(), fil_draft_sanitize_settings($invalid_mapping), 'Reject mappings to a different destination site');
+expect_same(['fil_draft_invalid'], $settings_errors, 'Report invalid mapping settings');
+$responses[$changed] = ['status' => 404, 'body' => 'missing'];
+unset($responses[$changed.'?ref=test']);
+$cache = [];
+$result = fil_draft_check_results([$source_changed], $localized, 1)[0];
+expect_same(false, isset($result['suggestions']), 'Do not suggest pages that cannot be verified');
+
+// Cross-site links always follow the destination article language, even if
+// the source site's language isn't available in the destination Polylang list.
+$cache = [];
+$options['home'] = 'https://www.example.net/blog';
+$english_main = 'https://www.example.net/isp-proxies/';
+$traditional_main = 'https://www.example.net/zh-tw/isp-proxies/';
+$responses[$main_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$english_main.'</loc></url><url><loc>'.$traditional_main.'</loc></url><url><loc>'.$main_isp.'</loc></url></urlset>'];
+$responses[$blog_sitemap] = ['status' => 200, 'body' => '<urlset><url><loc>'.$english_page.'</loc></url><url><loc>'.$traditional_page.'</loc></url></urlset>'];
+$responses[$english_main.'?ref=test'] = ['status' => 200];
+$responses[$traditional_main.'?ref=test'] = ['status' => 200];
+$responses[$main_isp.'?ref=test'] = ['status' => 200];
+$responses[$english_page.'?ref=test'] = ['status' => 200];
+$responses[$traditional_page.'?ref=test'] = ['status' => 200];
+$responses[$chinese_page.'?ref=test'] = ['status' => 200];
+$source_main_zh = 'https://www.example.io/zh-cn/isp-proxies/?ref=test#part';
+$source_blog_zh = 'https://www.example.io/blog/zh-cn/guide/?ref=test#part';
+$test_languages = ['en', 'zh-tw'];
+$results = fil_draft_check_results([$source_main_zh, $source_blog_zh], $localized, 2);
+expect_same([$english_main.'?ref=test#part', $english_page.'?ref=test#part'], array_column($results, 'url'), 'English removes the source language directory');
+$results = fil_draft_check_results([$source_main_zh, $source_blog_zh], $localized, 4);
+expect_same([$traditional_main.'?ref=test#part', $traditional_page.'?ref=test#part'], array_column($results, 'url'), 'Traditional Chinese replaces the source language directory');
+unset($test_languages);
+$results = fil_draft_check_results(['https://www.example.io/zh-tw/isp-proxies/?ref=test#part', 'https://www.example.io/blog/zh-tw/guide/?ref=test#part'], $localized, 1);
+expect_same([$main_isp.'?ref=test#part', $chinese_page.'?ref=test#part'], array_column($results, 'url'), 'Simplified Chinese replaces the source language directory');
+$cache = [];
+$options['home'] = 'https://www.example.io/blog';
+$test_languages = ['en', 'zh-tw'];
+$io_site = ['public_origin' => 'https://example.io', 'peer_hostname' => 'example.net', 'sitemap_url' => 'https://example.io/translated-sitemap.xml', 'on_missing' => 'keep'];
+$io_english = 'https://example.io/isp-proxies/';
+$io_tw = 'https://example.io/zh-tw/isp-proxies/';
+$io_blog = 'https://example.io/blog/zh-tw/guide/';
+$responses[$io_site['sitemap_url']] = ['status' => 200, 'body' => '<urlset><url><loc>'.$io_english.'</loc></url><url><loc>'.$io_tw.'</loc></url><url><loc>'.$io_blog.'</loc></url></urlset>'];
+$responses[$io_english] = ['status' => 200];
+$responses[$io_tw] = ['status' => 200];
+$responses[$io_blog] = ['status' => 200];
+expect_same($io_english, fil_draft_check_results(['https://www.example.net/zh-cn/isp-proxies/'], $io_site, 2)[0]['url'], 'The io English site removes zh-cn');
+$io_results = fil_draft_check_results(['https://www.example.net/zh-cn/isp-proxies/', 'https://www.example.net/blog/zh-cn/guide/'], $io_site, 4);
+expect_same([$io_tw, $io_blog], array_column($io_results, 'url'), 'The io Traditional site converts both main and blog URLs');
+$io_mapped = array_merge($io_site, ['url_mappings' => 'https://www.example.net/zh-cn/old-isp/ => https://example.io/zh-cn/isp-proxies/']);
+expect_same($io_tw, fil_draft_check_results(['https://www.example.net/zh-cn/old-isp/'], $io_mapped, 4)[0]['url'], 'An explicit mapping also follows the destination article language');
+$cache = [];
+$responses[$io_site['sitemap_url']] = ['status' => 200, 'body' => '<urlset><url><loc>'.$io_english.'</loc></url></urlset>'];
+expect_same('keep', fil_draft_check_results(['https://www.example.net/zh-cn/isp-proxies/'], $io_site, 4)[0]['action'], 'Do not silently fall back to English when the Traditional page is missing');
+unset($test_languages);
 echo "Draft-link checks passed.\n";

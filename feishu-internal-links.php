@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Feishu Internal Links
  * Description: Sync keyword rules from a Feishu document and add internal links in the block editor.
- * Version: 0.5.4
+ * Version: 0.5.7
  * Requires at least: 6.2
  * Requires PHP: 7.4
  */
